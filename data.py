@@ -1,9 +1,10 @@
-# data.py (unchanged - no modifications needed)
+# data.py (minor addition: function to get calib samples for Wanda)
 import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from sklearn.model_selection import StratifiedKFold, KFold
+import random
 
 LABEL_COLUMN = 'HateSpeech'
 
@@ -41,6 +42,18 @@ def load_and_preprocess_data(dataset_path):
     pos = np.sum(labels)
     print(f"\nDataset: {len(comments)} samples | Hate: {pos} ({pos/len(labels)*100:.2f}%)")
     return comments, labels
+
+def get_calibration_samples(comments, labels, num_samples=512, seed=42):
+    """Random stratified sample for Wanda calibration."""
+    random.seed(seed)
+    indices = list(range(len(comments)))
+    pos_indices = [i for i, l in enumerate(labels) if l == 1]
+    neg_indices = [i for i, l in enumerate(labels) if l == 0]
+    
+    pos_sample = random.sample(pos_indices, min(num_samples // 2, len(pos_indices)))
+    neg_sample = random.sample(neg_indices, min(num_samples // 2, len(neg_indices)))
+    calib_indices = pos_sample + neg_sample
+    return [comments[i] for i in calib_indices]
 
 def prepare_kfold_splits(comments, labels, num_folds=5, stratification_type='binary', seed=42):
     if stratification_type == 'binary':
