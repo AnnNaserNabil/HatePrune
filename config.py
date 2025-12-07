@@ -1,4 +1,4 @@
-# config.py (modified)
+# config.py (updated with pruning method selection)
 import argparse
 
 def parse_arguments():
@@ -30,14 +30,18 @@ def parse_arguments():
     parser.add_argument('--temperature', type=float, default=4.0,
                         help='Temperature for soft labels')
 
-    # Pruning (new options)
+    # Pruning (enhanced: Wanda + Gradual Magnitude)
     parser.add_argument('--prune', action='store_true', help='Enable pruning on student model')
-    parser.add_argument('--prune_amount', type=float, default=0.5,
-                        help='Fraction of weights to prune (e.g., 0.5 for 50% sparsity)')
-    parser.add_argument('--prune_type', type=str, default='l1_unstructured',
-                        choices=['l1_unstructured', 'random_unstructured'],
-                        help='Pruning method (from torch.nn.utils.prune)')
-    parser.add_argument('--prune_global', action='store_true', help='Apply global pruning instead of per-layer')
+    parser.add_argument('--prune_method', type=str, default='baseline',
+                        choices=['baseline', 'wanda', 'gradual_magnitude'],
+                        help='Pruning method: baseline (none), wanda (one-shot), gradual_magnitude (iterative)')
+    parser.add_argument('--prune_sparsity', type=float, default=0.6,
+                        help='Target sparsity (e.g., 0.6 for 60%)')
+    parser.add_argument('--calib_samples', type=int, default=512,
+                        help='Calibration samples for Wanda (random subset from dataset)')
+    parser.add_argument('--prune_freq', type=int, default=100,
+                        help='Pruning frequency (steps) for gradual_magnitude')
+    parser.add_argument('--prune_global', action='store_true', help='Global vs. per-layer pruning')
 
     # MLflow & others
     parser.add_argument('--author_name', type=str, required=True, help='Your name')
@@ -57,8 +61,8 @@ def parse_arguments():
     if args.num_folds < 2: raise ValueError("Folds >= 2")
     if not (0 <= args.dropout < 1): raise ValueError("Dropout in [0,1)")
     if not (0 <= args.warmup_ratio <= 1): raise ValueError("Warmup ratio in [0,1]")
-    if args.prune and not (0 < args.prune_amount < 1): raise ValueError("Prune amount in (0,1)")
-    if args.distill and args.prune: print("Warning: Distillation and pruning enabled together—pruning applied to student.")
+    if args.prune and not (0 < args.prune_sparsity < 1): raise ValueError("Prune sparsity in (0,1)")
+    if args.distill and args.prune: print("Warning: Distillation and pruning enabled—pruning applied to student.")
 
     return args
 
@@ -74,7 +78,11 @@ def print_config(config):
         print(f"Alpha (soft weight): {config.alpha}")
         print(f"Temperature: {config.temperature}")
     if config.prune:
-        print(f"Prune: Yes | Amount: {config.prune_amount} | Type: {config.prune_type} | Global: {config.prune_global}")
+        print(f"Prune Method: {config.prune_method} | Sparsity: {config.prune_sparsity} | Global: {config.prune_global}")
+        if config.prune_method == 'wanda':
+            print(f"Calib Samples: {config.calib_samples}")
+        else:
+            print(f"Prune Freq: {config.prune_freq}")
     print(f"Batch: {config.batch} | LR: {config.lr} | Epochs: {config.epochs}")
     print(f"K-Folds: {config.num_folds} | Stratify: {config.stratification_type}")
     print(f"Freeze Base: {config.freeze_base}")
