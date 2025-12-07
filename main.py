@@ -1,4 +1,4 @@
-# main.py (renamed from main_distill.py for generality; modified)
+# main.py (updated: handles calib samples, prune method logic)
 import os
 import time
 import torch
@@ -8,8 +8,8 @@ import pandas as pd
 import numpy as np
 from transformers import AutoTokenizer
 from config import parse_arguments, print_config
-from data import load_and_preprocess_data, prepare_kfold_splits, HateSpeechDataset, calculate_class_weights
-from model import Model  # Updated name from DistillationModel
+from data import load_and_preprocess_data, prepare_kfold_splits, HateSpeechDataset, calculate_class_weights, get_calibration_samples
+from model import Model
 from train import train_epoch, evaluate
 from utils import set_seed, get_model_metrics, print_experiment_summary, print_fold_summary
 from torch.optim import AdamW
@@ -27,6 +27,11 @@ def run_kfold(config, comments, labels, tokenizer, device):
     splits = list(prepare_kfold_splits(comments, labels, config.num_folds,
                                        config.stratification_type, config.seed))
 
+    # For Wanda: Get calib samples once
+    calib_texts = None
+    if config.prune and config.prune_method == 'wanda':
+        calib_texts = get_calibration_samples(comments, labels, config.calib_samples, config.seed)
+
     fold_results = []
     best_macro_f1 = -1
     best_fold_idx = -1
@@ -34,7 +39,7 @@ def run_kfold(config, comments, labels, tokenizer, device):
     best_overall_epoch = -1
     best_state_dict = None
 
-    run_name = f"{config.author_name}_{'Distill' if config.distill else 'Train'}{'_Prune' if config.prune else ''}"
+    run_name = f"{config.author_name}_{'Distill' if config.distill else 'Train'}{'_Prune' if config.prune else ''}_{config.prune_method}"
     with mlflow.start_run(run_name=run_name) as run:
         run_id = run.info.run_id
         mlflow.log_params(vars(config))
@@ -53,9 +58,11 @@ def run_kfold(config, comments, labels, tokenizer, device):
                 teacher_name=config.teacher if config.distill else None,
                 dropout=config.dropout,
                 prune=config.prune,
-                prune_amount=config.prune_amount,
-                prune_type=config.prune_type,
-                prune_global=config.prune_global
+                prune_method=config.prune_method,
+                prune_sparsity=config.prune_sparsity,
+                prune_global=config.prune_global,
+                calib_texts=calib_texts,  # For Wanda
+                device=device
             ).to(device)
 
             if config.freeze_base:
@@ -78,7 +85,9 @@ def run_kfold(config, comments, labels, tokenizer, device):
             for epoch in range(config.epochs):
                 train_metrics = train_epoch(model, train_loader, optimizer, scheduler, device,
                                             class_weights, config.temperature, config.alpha,
-                                            config.gradient_clip_norm, config.distill)
+                                            config.gradient_clip_norm, config.distill,
+                                            config.prune_method, config.prune_freq,
+                                            config.prune_sparsity)
                 val_metrics = evaluate(model, val_loader, device)
 
                 if val_metrics['macro_f1'] > best_val_macro:
@@ -96,7 +105,7 @@ def run_kfold(config, comments, labels, tokenizer, device):
             if best_fold_state is not None:
                 model.load_state_dict(best_fold_state)
 
-            # Make pruning permanent (remove masks, zero out weights)
+            # Make pruning permanent if applicable
             if config.prune:
                 model.make_pruning_permanent()
 
@@ -122,13 +131,11 @@ def run_kfold(config, comments, labels, tokenizer, device):
                 best_fold_idx = fold
                 best_overall_metrics = final_metrics
                 best_overall_epoch = best_epoch
-                best_state_dict = best_fold_state  # Note: pruning made permanent above, but state is before; reload if needed
+                best_state_dict = best_fold_state
 
-        # ===================================================================
-        # 1. SAVE BEST MODEL FOR HUGGING FACE DEPLOYMENT
-        # ===================================================================
+        # SAVE BEST MODEL
         model_name_safe = config.model_path.split('/')[-1]
-        mode_str = 'pruned' if config.prune else 'distilled' if config.distill else 'trained'
+        mode_str = f"{config.prune_method}_pruned" if config.prune else 'distilled' if config.distill else 'trained'
         best_model_dir = f"./best_{mode_str}_model_{config.author_name.replace(' ', '_')}_{model_name_safe}"
         os.makedirs(best_model_dir, exist_ok=True)
 
@@ -137,24 +144,23 @@ def run_kfold(config, comments, labels, tokenizer, device):
             teacher_name=config.teacher if config.distill else None,
             dropout=config.dropout,
             prune=config.prune,
-            prune_amount=config.prune_amount,
-            prune_type=config.prune_type,
-            prune_global=config.prune_global
+            prune_method=config.prune_method,
+            prune_sparsity=config.prune_sparsity,
+            prune_global=config.prune_global,
+            calib_texts=calib_texts,
+            device=device
         )
         final_model.load_state_dict(best_state_dict)
         if config.prune:
-            final_model.make_pruning_permanent()  # Ensure permanent for saved model
+            final_model.make_pruning_permanent()
         final_model.student.save_pretrained(best_model_dir)
         tokenizer.save_pretrained(best_model_dir)
 
-        print(f"\nBEST MODEL SAVED FOR DEPLOYMENT!")
+        print(f"\nBEST MODEL SAVED!")
         print(f"   → {os.path.abspath(best_model_dir)}")
         print(f"   → Val Macro F1: {best_macro_f1:.4f} (Fold {best_fold_idx+1}, Epoch {best_overall_epoch})")
-        print(f"   Upload with: huggingface-cli upload yourname/bangla-hate-{mode_str} {best_model_dir} .")
 
-        # ===================================================================
-        # 2. SAVE FULL 22-METRIC CSV (exactly like original repo)
-        # ===================================================================
+        # SAVE METRICS CSVs (same as before)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         best_csv_name = f"{mode_str}_best_metrics_batch{config.batch}_lr{config.lr}_epochs{config.epochs}_{timestamp}.csv"
         best_csv_path = os.path.join("./outputs", best_csv_name)
@@ -188,12 +194,10 @@ def run_kfold(config, comments, labels, tokenizer, device):
         pd.DataFrame(best_metrics_data).to_csv(best_csv_path, index=False)
         mlflow.log_artifact(best_csv_path)
 
-        # Also save all-fold summary
         all_folds_csv = f"{mode_str}_all_folds_summary_{timestamp}.csv"
         pd.DataFrame(fold_results).to_csv(f"./outputs/{all_folds_csv}", index=False)
         mlflow.log_artifact(f"./outputs/{all_folds_csv}")
 
-        # Log to MLflow
         mlflow.log_metric("best_val_macro_f1", best_macro_f1)
         mlflow.log_metric("best_fold", best_fold_idx + 1)
         mlflow.log_metric("best_epoch", best_overall_epoch)
@@ -201,12 +205,11 @@ def run_kfold(config, comments, labels, tokenizer, device):
         print_experiment_summary(best_fold_idx, best_overall_metrics, get_model_metrics(final_model))
 
         print(f"\n{'='*70}")
-        print("TRAINING COMPLETED SUCCESSFULLY!")
+        print("TRAINING COMPLETED!")
         print(f"   Best Model → {best_model_dir}")
         print(f"   Best Metrics CSV → {best_csv_name}")
         print(f"   All Folds CSV → {all_folds_csv}")
         print(f"   MLflow Run ID: {run_id}")
-        print(f"   Run: mlflow ui → http://localhost:5000")
         print("="*70)
 
 
