@@ -1,4 +1,4 @@
-# train.py (renamed from train_distill.py; modified to support non-distill mode)
+# train.py (updated: gradual prune in loop; Wanda is pre-applied)
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
@@ -30,18 +30,15 @@ def calculate_metrics(y_true, y_pred):
                 'precision_negative': p[0], 'recall_negative': r[0], 'f1_negative': f1[0],
                 'macro_f1': macro, 'roc_auc': auc, 'best_threshold': th
             }
-    best_metrics.update({f'macro_f1_th_{th}': 0 for th in thresholds})  # Placeholder for threshold-specific
     return best_metrics
 
 def distillation_loss(s_logits, t_logits, labels, T=4.0, alpha=0.7, pos_weight=None):
-    # Soft loss
     kl = F.kl_div(
         F.log_softmax(s_logits / T, dim=-1),
         F.softmax(t_logits / T, dim=-1),
         reduction='batchmean'
     ) * (T * T)
 
-    # Hard loss
     bce = F.binary_cross_entropy_with_logits(
         s_logits, labels.float(), pos_weight=pos_weight
     )
@@ -49,13 +46,16 @@ def distillation_loss(s_logits, t_logits, labels, T=4.0, alpha=0.7, pos_weight=N
     return alpha * kl + (1 - alpha) * bce
 
 def train_epoch(model, loader, optimizer, scheduler, device, class_weights=None,
-                T=4.0, alpha=0.7, max_norm=1.0, distill=True):
+                T=4.0, alpha=0.7, max_norm=1.0, distill=True, prune_method='baseline',
+                prune_freq=100, prune_sparsity=0.6):
     model.train()
     total_loss = 0
     scaler = GradScaler()
     pos_weight = class_weights.to(device) if class_weights is not None else None
+    total_steps = len(loader) * 100  # Approximate total for gradual
 
-    for batch in tqdm(loader, desc="Train"):
+    global_step = 0
+    for batch_idx, batch in enumerate(tqdm(loader, desc="Train")):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
@@ -80,6 +80,11 @@ def train_epoch(model, loader, optimizer, scheduler, device, class_weights=None,
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
+
+        # Gradual prune if applicable
+        global_step += 1
+        if prune_method == 'gradual_magnitude' and global_step % prune_freq == 0:
+            model.gradual_prune_step(global_step, total_steps)
 
         total_loss += loss.item()
 
