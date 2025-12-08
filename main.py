@@ -1,226 +1,210 @@
-# main.py (updated: handles calib samples, prune method logic)
-import os
-import time
+# main.py - FINAL VERSION WITH FULL METRICS PRINT & SAVE
 import torch
 from torch.utils.data import DataLoader
-import mlflow
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from config import parse_arguments
+from data import load_and_preprocess_data, get_kfold_splits, get_calibration_samples, get_class_weight, HateSpeechDataset
+from model import HateSpeechModel
+from train import train_one_epoch, evaluate
+from utils import set_seed, get_model_stats
+import os
 import pandas as pd
 import numpy as np
-from transformers import AutoTokenizer
-from config import parse_arguments, print_config
-from data import load_and_preprocess_data, prepare_kfold_splits, HateSpeechDataset, calculate_class_weights, get_calibration_samples
-from model import Model
-from train import train_epoch, evaluate
-from utils import set_seed, get_model_metrics, print_experiment_summary, print_fold_summary
-from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
 
+def print_experiment_summary(best_fold_idx, best_metrics, model_metrics):
+    print("\n" + "="*70)
+    print("                       EXPERIMENT COMPLETE")
+    print("="*70)
+    print(f"Best Fold              : {best_fold_idx + 1}")
+    print(f"Best Threshold         : {best_metrics['threshold']:.3f}")
+    print(f"Val Accuracy           : {best_metrics['accuracy']:.4f}")
+    print(f"Val Precision (Hate)   : {best_metrics['precision']:.4f}")
+    print(f"Val Recall (Hate)      : {best_metrics['recall']:.4f}")
+    print(f"Val F1 (Hate)          : {best_metrics['f1']:.4f}")
+    print(f"Val Precision (Non-Hate): {best_metrics['precision_neg']:.4f}")
+    print(f"Val Recall (Non-Hate)  : {best_metrics['recall_neg']:.4f}")
+    print(f"Val F1 (Non-Hate)      : {best_metrics['f1_neg']:.4f}")
+    print(f"Val Macro F1           : {best_metrics['macro_f1']:.4f}")
+    print(f"Val ROC-AUC            : {best_metrics['roc_auc']:.4f}")
+    print(f"Val Loss               : {best_metrics['loss']:.4f}")
+    print("-"*70)
+    print(f"Train Accuracy         : {best_metrics['train_accuracy']:.4f}")
+    print(f"Train Precision (Hate) : {best_metrics['train_precision']:.4f}")
+    print(f"Train Recall (Hate)    : {best_metrics['train_recall']:.4f}")
+    print(f"Train F1 (Hate)        : {best_metrics['train_f1']:.4f}")
+    print(f"Train Macro F1         : {best_metrics['train_macro_f1']:.4f}")
+    print(f"Train ROC-AUC          : {best_metrics['train_roc_auc']:.4f}")
+    print(f"Train Loss             : {best_metrics['train_loss']:.4f}")
+    print("="*70)
+    print("Model Size & Pruning Stats")
+    print("="*70)
+    print(f"Total params           : {model_metrics['total_params']:,}")
+    print(f"Trainable params       : {model_metrics['trainable']:,}")
+    print(f"Model size (MB)        : {model_metrics['size_mb']}")
+    print(f"Sparsity               : {model_metrics['sparsity_%']}%")
+    print(f"Non-zero weights       : {model_metrics['non_zero']:,}")
+    print(f"Total weights          : {model_metrics['total_weights']:,}")
+    print("="*70 + "\n")
 
-def run_kfold(config, comments, labels, tokenizer, device):
-    os.makedirs('./outputs', exist_ok=True)
-    os.makedirs('./cache', exist_ok=True)
+def run_kfold(config):
+    set_seed(config.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
 
-    mlflow.set_tracking_uri("file://./mlruns")
-    mlflow.set_experiment(config.mlflow_experiment_name)
+    comments, labels = load_and_preprocess_data(config.dataset_path)
+    class_weight = get_class_weight(labels)
 
-    class_weights = calculate_class_weights(labels)
-    splits = list(prepare_kfold_splits(comments, labels, config.num_folds,
-                                       config.stratification_type, config.seed))
-
-    # For Wanda: Get calib samples once
-    calib_texts = None
-    if config.prune and config.prune_method == 'wanda':
-        calib_texts = get_calibration_samples(comments, labels, config.calib_samples, config.seed)
-
-    fold_results = []
+    all_fold_results = []
     best_macro_f1 = -1
+    best_model_state = None
     best_fold_idx = -1
-    best_overall_metrics = {}
-    best_overall_epoch = -1
-    best_state_dict = None
+    best_train_metrics = None
 
-    run_name = f"{config.author_name}_{'Distill' if config.distill else 'Train'}{'_Prune' if config.prune else ''}_{config.prune_method}"
-    with mlflow.start_run(run_name=run_name) as run:
-        run_id = run.info.run_id
-        mlflow.log_params(vars(config))
+    print(f"\nStarting {config.num_folds}-Fold Cross Validation...\n")
 
-        for fold, (train_idx, val_idx) in enumerate(splits):
-            print(f"\n{'='*30} FOLD {fold+1}/{config.num_folds} {'='*30}")
+    for fold, (train_idx, val_idx) in enumerate(get_kfold_splits(comments, labels, config.num_folds, stratify=True)):
+        print(f"\n{'='*20} FOLD {fold+1}/{config.num_folds} {'='*20}")
 
-            train_ds = HateSpeechDataset(comments[train_idx], labels[train_idx], tokenizer, config.max_length)
-            val_ds = HateSpeechDataset(comments[val_idx], labels[val_idx], tokenizer, config.max_length)
+        train_comments, val_comments = comments[train_idx], comments[val_idx]
+        train_labels, val_labels = labels[train_idx], labels[val_idx]
 
-            train_loader = DataLoader(train_ds, batch_size=config.batch, shuffle=True, num_workers=4, pin_memory=True)
-            val_loader = DataLoader(val_ds, batch_size=config.batch, shuffle=False, num_workers=4, pin_memory=True)
+        train_ds = HateSpeechDataset(train_comments, train_labels, tokenizer, config.max_length)
+        val_ds = HateSpeechDataset(val_comments, val_labels, tokenizer, config.max_length)
 
-            model = Model(
-                student_name=config.model_path,
-                teacher_name=config.teacher if config.distill else None,
-                dropout=config.dropout,
-                prune=config.prune,
-                prune_method=config.prune_method,
-                prune_sparsity=config.prune_sparsity,
-                prune_global=config.prune_global,
-                calib_texts=calib_texts,  # For Wanda
-                device=device
-            ).to(device)
+        train_loader = DataLoader(train_ds, batch_size=config.batch, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=config.batch, shuffle=False, num_workers=4, pin_memory=True)
 
-            if config.freeze_base:
-                for p in model.student.parameters():
-                    p.requires_grad = False
+        # Wanda calibration
+        calib_texts = None
+        if config.prune and config.prune_method == 'wanda':
+            calib_texts = get_calibration_samples(comments, labels, config.calib_samples, config.seed)
 
-            optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                              lr=config.lr, weight_decay=config.weight_decay)
-            total_steps = len(train_loader) * config.epochs
-            scheduler = get_linear_schedule_with_warmup(optimizer,
-                num_warmup_steps=int(config.warmup_ratio * total_steps),
-                num_training_steps=total_steps)
-
-            # Per-fold early stopping
-            best_val_macro = -1
-            best_fold_state = None
-            best_epoch = 0
-            patience_counter = 0
-
-            for epoch in range(config.epochs):
-                train_metrics = train_epoch(model, train_loader, optimizer, scheduler, device,
-                                            class_weights, config.temperature, config.alpha,
-                                            config.gradient_clip_norm, config.distill,
-                                            config.prune_method, config.prune_freq,
-                                            config.prune_sparsity)
-                val_metrics = evaluate(model, val_loader, device)
-
-                if val_metrics['macro_f1'] > best_val_macro:
-                    best_val_macro = val_metrics['macro_f1']
-                    best_fold_state = {k: v.cpu() for k, v in model.state_dict().items()}
-                    best_epoch = epoch + 1
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= config.early_stopping_patience:
-                        print(f"Early stopping triggered at epoch {epoch+1}")
-                        break
-
-            # Load best checkpoint of this fold
-            if best_fold_state is not None:
-                model.load_state_dict(best_fold_state)
-
-            # Make pruning permanent if applicable
-            if config.prune:
-                model.make_pruning_permanent()
-
-            # Final evaluation
-            val_metrics = evaluate(model, val_loader, device)
-            train_metrics = evaluate(model, train_loader, device)
-
-            # Combine metrics
-            final_metrics = val_metrics.copy()
-            for k, v in train_metrics.items():
-                if k != 'best_threshold':
-                    final_metrics[f'train_{k}'] = v
-            final_metrics['best_epoch'] = best_epoch
-            final_metrics['loss'] = val_metrics.get('loss', 0.0)
-            final_metrics['train_loss'] = train_metrics.get('loss', 0.0)
-
-            fold_results.append(final_metrics)
-            print_fold_summary(fold, final_metrics, best_epoch)
-
-            # Update global best
-            if val_metrics['macro_f1'] > best_macro_f1:
-                best_macro_f1 = val_metrics['macro_f1']
-                best_fold_idx = fold
-                best_overall_metrics = final_metrics
-                best_overall_epoch = best_epoch
-                best_state_dict = best_fold_state
-
-        # SAVE BEST MODEL
-        model_name_safe = config.model_path.split('/')[-1]
-        mode_str = f"{config.prune_method}_pruned" if config.prune else 'distilled' if config.distill else 'trained'
-        best_model_dir = f"./best_{mode_str}_model_{config.author_name.replace(' ', '_')}_{model_name_safe}"
-        os.makedirs(best_model_dir, exist_ok=True)
-
-        final_model = Model(
+        model = HateSpeechModel(
             student_name=config.model_path,
             teacher_name=config.teacher if config.distill else None,
             dropout=config.dropout,
             prune=config.prune,
             prune_method=config.prune_method,
-            prune_sparsity=config.prune_sparsity,
-            prune_global=config.prune_global,
+            sparsity=config.prune_sparsity,
+            global_prune=config.prune_global,
             calib_texts=calib_texts,
             device=device
-        )
-        final_model.load_state_dict(best_state_dict)
-        if config.prune:
-            final_model.make_pruning_permanent()
-        final_model.student.save_pretrained(best_model_dir)
-        tokenizer.save_pretrained(best_model_dir)
+        ).to(device)
 
-        print(f"\nBEST MODEL SAVED!")
-        print(f"   → {os.path.abspath(best_model_dir)}")
-        print(f"   → Val Macro F1: {best_macro_f1:.4f} (Fold {best_fold_idx+1}, Epoch {best_overall_epoch})")
+        if config.freeze_base:
+            for p in model.student.parameters():
+                p.requires_grad = False
 
-        # SAVE METRICS CSVs (same as before)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        best_csv_name = f"{mode_str}_best_metrics_batch{config.batch}_lr{config.lr}_epochs{config.epochs}_{timestamp}.csv"
-        best_csv_path = os.path.join("./outputs", best_csv_name)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        total_steps = len(train_loader) * config.epochs
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * config.warmup_ratio), num_training_steps=total_steps)
 
-        best_metrics_data = {
-            'Best Fold': [f'Fold {best_fold_idx + 1}'],
-            'Best Epoch': [best_overall_epoch],
-            'Val Accuracy': [best_overall_metrics['accuracy']],
-            'Val Precision (Hate)': [best_overall_metrics['precision']],
-            'Val Recall (Hate)': [best_overall_metrics['recall']],
-            'Val F1 (Hate)': [best_overall_metrics['f1']],
-            'Val Precision (Non-Hate)': [best_overall_metrics['precision_negative']],
-            'Val Recall (Non-Hate)': [best_overall_metrics['recall_negative']],
-            'Val F1 (Non-Hate)': [best_overall_metrics['f1_negative']],
-            'Val Macro F1': [best_overall_metrics['macro_f1']],
-            'Val ROC-AUC': [best_overall_metrics['roc_auc']],
-            'Val Loss': [best_overall_metrics['loss']],
-            'Best Threshold': [best_overall_metrics['best_threshold']],
-            'Train Accuracy': [best_overall_metrics['train_accuracy']],
-            'Train Precision (Hate)': [best_overall_metrics['train_precision']],
-            'Train Recall (Hate)': [best_overall_metrics['train_recall']],
-            'Train F1 (Hate)': [best_overall_metrics['train_f1']],
-            'Train Precision (Non-Hate)': [best_overall_metrics['train_precision_negative']],
-            'Train Recall (Non-Hate)': [best_overall_metrics['train_recall_negative']],
-            'Train F1 (Non-Hate)': [best_overall_metrics['train_f1_negative']],
-            'Train Macro F1': [best_overall_metrics['train_macro_f1']],
-            'Train ROC-AUC': [best_overall_metrics['train_roc_auc']],
-            'Train Loss': [best_overall_metrics['train_loss']]
-        }
+        best_val_macro = -1
+        best_state = None
+        patience_counter = 0
+        global_step = [0]
 
-        pd.DataFrame(best_metrics_data).to_csv(best_csv_path, index=False)
-        mlflow.log_artifact(best_csv_path)
+        # Store best train metrics too
+        best_train_metrics_this_fold = None
 
-        all_folds_csv = f"{mode_str}_all_folds_summary_{timestamp}.csv"
-        pd.DataFrame(fold_results).to_csv(f"./outputs/{all_folds_csv}", index=False)
-        mlflow.log_artifact(f"./outputs/{all_folds_csv}")
+        for epoch in range(1, config.epochs + 1):
+            train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, config, class_weight, global_step)
+            
+            # Evaluate on train set too for full reporting
+            train_metrics = evaluate(model, train_loader, device)
+            val_metrics = evaluate(model, val_loader, device)
 
-        mlflow.log_metric("best_val_macro_f1", best_macro_f1)
-        mlflow.log_metric("best_fold", best_fold_idx + 1)
-        mlflow.log_metric("best_epoch", best_overall_epoch)
+            print(f"Epoch {epoch:2d} | Train Loss: {train_loss:.4f} | Val Loss: {val_metrics['loss']:.4f} | Val Macro F1: {val_metrics['macro_f1']:.4f}")
 
-        print_experiment_summary(best_fold_idx, best_overall_metrics, get_model_metrics(final_model))
+            if val_metrics['macro_f1'] > best_val_macro:
+                best_val_macro = val_metrics['macro_f1']
+                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                best_train_metrics_this_fold = train_metrics.copy()
+                best_train_metrics_this_fold.update({'train_loss': train_loss})
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= config.early_stopping_patience:
+                    print("Early stopping triggered")
+                    break
 
-        print(f"\n{'='*70}")
-        print("TRAINING COMPLETED!")
-        print(f"   Best Model → {best_model_dir}")
-        print(f"   Best Metrics CSV → {best_csv_name}")
-        print(f"   All Folds CSV → {all_folds_csv}")
-        print(f"   MLflow Run ID: {run_id}")
-        print("="*70)
+        # Make pruning permanent after training
+        if config.prune and config.prune_method == 'gradual_magnitude':
+            model.make_pruning_permanent()
 
+        # Save fold result
+        result = val_metrics.copy()
+        result.update({
+            'fold': fold + 1,
+            'train_loss': train_loss,
+            'train_accuracy': train_metrics['accuracy'],
+            'train_precision': train_metrics['precision'],
+            'train_recall': train_metrics['recall'],
+            'train_f1': train_metrics['f1'],
+            'train_macro_f1': train_metrics['macro_f1'],
+            'train_roc_auc': train_metrics['roc_auc'],
+            'best_threshold': val_metrics['threshold']
+        })
+        all_fold_results.append(result)
+
+        if best_val_macro > best_macro_f1:
+            best_macro_f1 = best_val_macro
+            best_model_state = best_state
+            best_fold_idx = fold
+            best_train_metrics = best_train_metrics_this_fold
+
+        print(f"Fold {fold+1} Best Val Macro F1: {best_val_macro:.4f}\n")
+
+    # FINAL BEST MODEL
+    print(f"\nBEST MODEL FROM FOLD {best_fold_idx + 1} (Macro F1 = {best_macro_f1:.4f})")
+
+    final_model = HateSpeechModel(
+        student_name=config.model_path,
+        teacher_name=None,  # no teacher needed for inference
+        dropout=config.dropout,
+        prune=False
+    ).to('cpu')
+    final_model.load_state_dict(best_model_state)
+    
+    if config.prune and config.prune_method == 'gradual_magnitude':
+        final_model.make_pruning_permanent()
+
+    # Save model for Hugging Face
+    save_dir = "./bangla-hate-distill-pruned"
+    os.makedirs(save_dir, exist_ok=True)
+    final_model.student.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    torch.save(final_model.classifier.state_dict(), os.path.join(save_dir, "classifier.pt"))
+
+    # Final model stats
+    model_stats = get_model_stats(final_model)
+
+    # Add train metrics to best result
+    best_result = all_fold_results[best_fold_idx]
+    best_result.update({
+        'train_accuracy': best_train_metrics['accuracy'],
+        'train_precision': best_train_metrics['precision'],
+        'train_recall': best_train_metrics['recall'],
+        'train_f1': best_train_metrics['f1'],
+        'train_macro_f1': best_train_metrics['macro_f1'],
+        'train_roc_auc': best_train_metrics['roc_auc'],
+        'train_loss': best_train_metrics['train_loss'],
+    })
+
+    # PRINT FULL SUMMARY
+    print_experiment_summary(best_fold_idx, best_result, model_stats)
+
+    # SAVE TO CSV
+    df = pd.DataFrame(all_fold_results)
+    df.to_csv("5_fold_cv_results.csv", index=False)
+    best_result_df = pd.Series(best_result)
+    best_result_df.to_csv("BEST_MODEL_FULL_METRICS.csv")
+
+    print(f"\nModel saved to → {save_dir}")
+    print("5-fold results → 5_fold_cv_results.csv")
+    print("Best model full metrics → BEST_MODEL_FULL_METRICS.csv")
+    print("Ready for upload to Hugging Face")
 
 if __name__ == "__main__":
     config = parse_arguments()
-    print_config(config)
-    set_seed(config.seed)
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
-    comments, labels = load_and_preprocess_data(config.dataset_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    run_kfold(config, comments, labels, tokenizer, device)
+    run_kfold(config)
