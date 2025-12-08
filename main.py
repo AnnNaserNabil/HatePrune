@@ -1,4 +1,4 @@
-# main.py - FINAL VERSION WITH FULL METRICS PRINT & SAVE
+# main.py - FIXED PERMANENT PRUNING BEFORE SAVE
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
@@ -10,45 +10,48 @@ from utils import set_seed, get_model_stats
 import os
 import pandas as pd
 import numpy as np
+import warnings
+warnings.filterwarnings("ignore")  # Suppress traitlets warnings
 
 def print_experiment_summary(best_fold_idx, best_metrics, model_metrics):
     print("\n" + "="*70)
     print("                       EXPERIMENT COMPLETE")
     print("="*70)
     print(f"Best Fold              : {best_fold_idx + 1}")
-    print(f"Best Threshold         : {best_metrics['threshold']:.3f}")
-    print(f"Val Accuracy           : {best_metrics['accuracy']:.4f}")
-    print(f"Val Precision (Hate)   : {best_metrics['precision']:.4f}")
-    print(f"Val Recall (Hate)      : {best_metrics['recall']:.4f}")
-    print(f"Val F1 (Hate)          : {best_metrics['f1']:.4f}")
-    print(f"Val Precision (Non-Hate): {best_metrics['precision_neg']:.4f}")
-    print(f"Val Recall (Non-Hate)  : {best_metrics['recall_neg']:.4f}")
-    print(f"Val F1 (Non-Hate)      : {best_metrics['f1_neg']:.4f}")
-    print(f"Val Macro F1           : {best_metrics['macro_f1']:.4f}")
-    print(f"Val ROC-AUC            : {best_metrics['roc_auc']:.4f}")
-    print(f"Val Loss               : {best_metrics['loss']:.4f}")
+    print(f"Best Threshold         : {best_metrics.get('threshold', 0.5):.3f}")
+    print(f"Val Accuracy           : {best_metrics.get('accuracy', 0):.4f}")
+    print(f"Val Precision (Hate)   : {best_metrics.get('precision', 0):.4f}")
+    print(f"Val Recall (Hate)      : {best_metrics.get('recall', 0):.4f}")
+    print(f"Val F1 (Hate)          : {best_metrics.get('f1', 0):.4f}")
+    print(f"Val Precision (Non-Hate): {best_metrics.get('precision_neg', 0):.4f}")
+    print(f"Val Recall (Non-Hate)  : {best_metrics.get('recall_neg', 0):.4f}")
+    print(f"Val F1 (Non-Hate)      : {best_metrics.get('f1_neg', 0):.4f}")
+    print(f"Val Macro F1           : {best_metrics.get('macro_f1', 0):.4f}")
+    print(f"Val ROC-AUC            : {best_metrics.get('roc_auc', 0):.4f}")
+    print(f"Val Loss               : {best_metrics.get('loss', 0):.4f}")
     print("-"*70)
-    print(f"Train Accuracy         : {best_metrics['train_accuracy']:.4f}")
-    print(f"Train Precision (Hate) : {best_metrics['train_precision']:.4f}")
-    print(f"Train Recall (Hate)    : {best_metrics['train_recall']:.4f}")
-    print(f"Train F1 (Hate)        : {best_metrics['train_f1']:.4f}")
-    print(f"Train Macro F1         : {best_metrics['train_macro_f1']:.4f}")
-    print(f"Train ROC-AUC          : {best_metrics['train_roc_auc']:.4f}")
-    print(f"Train Loss             : {best_metrics['train_loss']:.4f}")
+    print(f"Train Accuracy         : {best_metrics.get('train_accuracy', 0):.4f}")
+    print(f"Train Precision (Hate) : {best_metrics.get('train_precision', 0):.4f}")
+    print(f"Train Recall (Hate)    : {best_metrics.get('train_recall', 0):.4f}")
+    print(f"Train F1 (Hate)        : {best_metrics.get('train_f1', 0):.4f}")
+    print(f"Train Macro F1         : {best_metrics.get('train_macro_f1', 0):.4f}")
+    print(f"Train ROC-AUC          : {best_metrics.get('train_roc_auc', 0):.4f}")
+    print(f"Train Loss             : {best_metrics.get('train_loss', 0):.4f}")
     print("="*70)
     print("Model Size & Pruning Stats")
     print("="*70)
-    print(f"Total params           : {model_metrics['total_params']:,}")
-    print(f"Trainable params       : {model_metrics['trainable']:,}")
-    print(f"Model size (MB)        : {model_metrics['size_mb']}")
-    print(f"Sparsity               : {model_metrics['sparsity_%']}%")
-    print(f"Non-zero weights       : {model_metrics['non_zero']:,}")
-    print(f"Total weights          : {model_metrics['total_weights']:,}")
+    print(f"Total params           : {model_metrics.get('total_params', 0):,}")
+    print(f"Trainable params       : {model_metrics.get('trainable', 0):,}")
+    print(f"Model size (MB)        : {model_metrics.get('size_mb', 0)}")
+    print(f"Sparsity               : {model_metrics.get('sparsity_%', 0)}%")
+    print(f"Non-zero weights       : {model_metrics.get('non_zero', 0):,}")
+    print(f"Total weights          : {model_metrics.get('total_weights', 0):,}")
     print("="*70 + "\n")
 
 def run_kfold(config):
     set_seed(config.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     tokenizer = AutoTokenizer.from_pretrained(config.model_path)
 
     comments, labels = load_and_preprocess_data(config.dataset_path)
@@ -71,8 +74,8 @@ def run_kfold(config):
         train_ds = HateSpeechDataset(train_comments, train_labels, tokenizer, config.max_length)
         val_ds = HateSpeechDataset(val_comments, val_labels, tokenizer, config.max_length)
 
-        train_loader = DataLoader(train_ds, batch_size=config.batch, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=config.batch, shuffle=False, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_ds, batch_size=config.batch, shuffle=True, num_workers=2, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=config.batch, shuffle=False, num_workers=2, pin_memory=True)
 
         # Wanda calibration
         calib_texts = None
@@ -95,22 +98,28 @@ def run_kfold(config):
             for p in model.student.parameters():
                 p.requires_grad = False
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], 
+            lr=config.lr, weight_decay=config.weight_decay
+        )
         total_steps = len(train_loader) * config.epochs
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * config.warmup_ratio), num_training_steps=total_steps)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=int(total_steps * config.warmup_ratio), 
+            num_training_steps=total_steps
+        )
 
         best_val_macro = -1
         best_state = None
         patience_counter = 0
         global_step = [0]
 
-        # Store best train metrics too
         best_train_metrics_this_fold = None
 
         for epoch in range(1, config.epochs + 1):
             train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, config, class_weight, global_step)
             
-            # Evaluate on train set too for full reporting
+            # Evaluate train and val
             train_metrics = evaluate(model, train_loader, device)
             val_metrics = evaluate(model, val_loader, device)
 
@@ -118,6 +127,12 @@ def run_kfold(config):
 
             if val_metrics['macro_f1'] > best_val_macro:
                 best_val_macro = val_metrics['macro_f1']
+                
+                # FIXED: Make permanent BEFORE saving state_dict
+                if config.prune and config.prune_method == 'gradual_magnitude':
+                    print("Making pruning permanent before saving best state...")
+                    model.make_pruning_permanent()
+                
                 best_state = {k: v.cpu() for k, v in model.state_dict().items()}
                 best_train_metrics_this_fold = train_metrics.copy()
                 best_train_metrics_this_fold.update({'train_loss': train_loss})
@@ -128,11 +143,7 @@ def run_kfold(config):
                     print("Early stopping triggered")
                     break
 
-        # Make pruning permanent after training
-        if config.prune and config.prune_method == 'gradual_magnitude':
-            model.make_pruning_permanent()
-
-        # Save fold result
+        # Fold result (use last eval for train, but best for val)
         result = val_metrics.copy()
         result.update({
             'fold': fold + 1,
@@ -143,7 +154,7 @@ def run_kfold(config):
             'train_f1': train_metrics['f1'],
             'train_macro_f1': train_metrics['macro_f1'],
             'train_roc_auc': train_metrics['roc_auc'],
-            'best_threshold': val_metrics['threshold']
+            'threshold': val_metrics['threshold']  # Fixed key
         })
         all_fold_results.append(result)
 
@@ -158,29 +169,32 @@ def run_kfold(config):
     # FINAL BEST MODEL
     print(f"\nBEST MODEL FROM FOLD {best_fold_idx + 1} (Macro F1 = {best_macro_f1:.4f})")
 
+    # Create final model WITHOUT pruning (will load permanent state)
     final_model = HateSpeechModel(
         student_name=config.model_path,
-        teacher_name=None,  # no teacher needed for inference
+        teacher_name=None,  # No teacher for inference
         dropout=config.dropout,
-        prune=False
-    ).to('cpu')
-    final_model.load_state_dict(best_model_state)
+        prune=False  # Key: No re-pruning
+    ).to(device)
     
-    if config.prune and config.prune_method == 'gradual_magnitude':
-        final_model.make_pruning_permanent()
+    # Load the permanent state (no more error!)
+    final_model.load_state_dict(best_model_state)
 
-    # Save model for Hugging Face
+    # Save for Hugging Face
     save_dir = "./bangla-hate-distill-pruned"
     os.makedirs(save_dir, exist_ok=True)
     final_model.student.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
     torch.save(final_model.classifier.state_dict(), os.path.join(save_dir, "classifier.pt"))
+    print(f"Model saved successfully to {save_dir}")
 
-    # Final model stats
+    # Final stats
     model_stats = get_model_stats(final_model)
+    model_stats['non_zero'] = sum((p != 0).sum().item() for p in final_model.parameters() if p.ndim > 1)
+    model_stats['total_weights'] = sum(p.numel() for p in final_model.parameters() if p.ndim > 1)
 
-    # Add train metrics to best result
-    best_result = all_fold_results[best_fold_idx]
+    # Combine best metrics
+    best_result = all_fold_results[best_fold_idx].copy()
     best_result.update({
         'train_accuracy': best_train_metrics['accuracy'],
         'train_precision': best_train_metrics['precision'],
@@ -189,21 +203,28 @@ def run_kfold(config):
         'train_macro_f1': best_train_metrics['macro_f1'],
         'train_roc_auc': best_train_metrics['roc_auc'],
         'train_loss': best_train_metrics['train_loss'],
+        'threshold': best_result.get('threshold', 0.5),  # Ensure key exists
+        'precision_neg': best_result.get('precision_neg', 0),
+        'recall_neg': best_result.get('recall_neg', 0),
+        'f1_neg': best_result.get('f1_neg', 0),
     })
 
-    # PRINT FULL SUMMARY
+    # PRINT THE FULL TABLE
     print_experiment_summary(best_fold_idx, best_result, model_stats)
 
-    # SAVE TO CSV
+    # SAVE CSVs
     df = pd.DataFrame(all_fold_results)
     df.to_csv("5_fold_cv_results.csv", index=False)
-    best_result_df = pd.Series(best_result)
-    best_result_df.to_csv("BEST_MODEL_FULL_METRICS.csv")
+    print(f"\n5-fold results saved to: 5_fold_cv_results.csv")
+    print(df[['fold', 'macro_f1', 'f1', 'accuracy', 'roc_auc']].round(4))
 
-    print(f"\nModel saved to → {save_dir}")
-    print("5-fold results → 5_fold_cv_results.csv")
-    print("Best model full metrics → BEST_MODEL_FULL_METRICS.csv")
-    print("Ready for upload to Hugging Face")
+    best_df = pd.Series(best_result)
+    best_df.to_csv("BEST_MODEL_FULL_METRICS.csv")
+    print(f"\nBest model metrics saved to: BEST_MODEL_FULL_METRICS.csv")
+
+    # MLflow note (if you want it later)
+    if hasattr(config, 'mlflow_experiment_name'):
+        print(f"MLflow experiment '{config.mlflow_experiment_name}' ready for logging (add mlflow code if needed)")
 
 if __name__ == "__main__":
     config = parse_arguments()
