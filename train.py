@@ -47,12 +47,12 @@ def distillation_loss(s_logits, t_logits, labels, T=4.0, alpha=0.7, pos_weight=N
 
 def train_epoch(model, loader, optimizer, scheduler, device, class_weights=None,
                 T=4.0, alpha=0.7, max_norm=1.0, distill=True, prune_method='baseline',
-                prune_freq=100, prune_sparsity=0.6):
+                prune_freq=100, prune_sparsity=0.6, epochs=12):
     model.train()
     total_loss = 0
     scaler = GradScaler()
     pos_weight = class_weights.to(device) if class_weights is not None else None
-    total_steps = len(loader) * 100  # Approximate total for gradual
+    total_steps = len(loader) * epochs  # Correct total steps using epochs
 
     global_step = 0
     for batch_idx, batch in enumerate(tqdm(loader, desc="Train")):
