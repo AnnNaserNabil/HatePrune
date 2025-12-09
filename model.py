@@ -73,24 +73,35 @@ class Model(nn.Module):
         for name, module in self.student.named_modules():
             if isinstance(module, nn.Linear):
                 self.modules_to_prune.append((module, 'weight'))
-        # Initial mask (will update iteratively in train.py)
+        # Add classifier layers to prune
+        for name, module in self.classifier.named_modules():
+            if isinstance(module, nn.Linear):
+                self.modules_to_prune.append((module, 'weight'))
+        # Initial mask (start at 0 sparsity)
         if self.prune_global:
-            prune.global_unstructured(self.modules_to_prune, pruning_method=prune.L1Unstructured, amount=0.0)  # Start at 0
+            prune.global_unstructured(self.modules_to_prune, pruning_method=prune.L1Unstructured, amount=0.0)
 
     def gradual_prune_step(self, current_step, total_steps):
         if self.prune_method != 'gradual_magnitude':
             return
-        sparsity = min(self.prune_sparsity * (current_step / total_steps), self.prune_sparsity)
-        print(f"Gradual prune at step {current_step}: current sparsity {sparsity:.2f}")
+        # Cubic schedule for gradual increase
+        progress = min(1.0, current_step / total_steps)
+        current_sparsity = self.prune_sparsity * (progress ** 3)  # Cubic ramp-up
+        current_sparsity = min(current_sparsity, self.prune_sparsity)
+        print(f"Gradual prune at step {current_step}/{total_steps}: current sparsity {current_sparsity:.4f}")
+
         if self.prune_global:
-            prune.global_unstructured(self.modules_to_prune, pruning_method=prune.L1Unstructured, amount=sparsity)
+            prune.global_unstructured(self.modules_to_prune, pruning_method=prune.L1Unstructured, amount=current_sparsity)
         else:
             for module, param in self.modules_to_prune:
-                prune.l1_unstructured(module, name=param, amount=sparsity)
+                prune.l1_unstructured(module, name=param, amount=current_sparsity)
 
     def make_pruning_permanent(self):
         print("Making pruning permanent...")
         for module in self.student.modules():
+            if hasattr(module, 'weight') and prune.is_pruned(module):
+                prune.remove(module, 'weight')
+        for module in self.classifier.modules():
             if hasattr(module, 'weight') and prune.is_pruned(module):
                 prune.remove(module, 'weight')
         # For Wanda, already permanent (direct zeroing)
