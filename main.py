@@ -87,7 +87,7 @@ def run_kfold(config, comments, labels, tokenizer, device):
                                             class_weights, config.temperature, config.alpha,
                                             config.gradient_clip_norm, config.distill,
                                             config.prune_method, config.prune_freq,
-                                            config.prune_sparsity)
+                                            config.prune_sparsity, config.epochs)
                 val_metrics = evaluate(model, val_loader, device)
 
                 if val_metrics['macro_f1'] > best_val_macro:
@@ -151,8 +151,17 @@ def run_kfold(config, comments, labels, tokenizer, device):
             device=device
         )
         final_model.load_state_dict(best_state_dict)
+
+        # Get metrics BEFORE making pruning permanent
+        metrics_before_prune = get_model_metrics(final_model)
+
+        # Make pruning permanent if applicable
         if config.prune:
             final_model.make_pruning_permanent()
+
+        # Get metrics AFTER making pruning permanent
+        metrics_after_prune = get_model_metrics(final_model)
+
         final_model.student.save_pretrained(best_model_dir)
         tokenizer.save_pretrained(best_model_dir)
 
@@ -160,12 +169,13 @@ def run_kfold(config, comments, labels, tokenizer, device):
         print(f"   → {os.path.abspath(best_model_dir)}")
         print(f"   → Val Macro F1: {best_macro_f1:.4f} (Fold {best_fold_idx+1}, Epoch {best_overall_epoch})")
 
-        # SAVE METRICS CSVs (same as before)
+        # SAVE METRICS CSVs
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         best_csv_name = f"{mode_str}_best_metrics_batch{config.batch}_lr{config.lr}_epochs{config.epochs}_{timestamp}.csv"
         best_csv_path = os.path.join("./outputs", best_csv_name)
 
         best_metrics_data = {
+            'Epochs': [config.epochs],
             'Best Fold': [f'Fold {best_fold_idx + 1}'],
             'Best Epoch': [best_overall_epoch],
             'Val Accuracy': [best_overall_metrics['accuracy']],
@@ -188,21 +198,54 @@ def run_kfold(config, comments, labels, tokenizer, device):
             'Train F1 (Non-Hate)': [best_overall_metrics['train_f1_negative']],
             'Train Macro F1': [best_overall_metrics['train_macro_f1']],
             'Train ROC-AUC': [best_overall_metrics['train_roc_auc']],
-            'Train Loss': [best_overall_metrics['train_loss']]
+            'Train Loss': [best_overall_metrics['train_loss']],
+            'Total Parameters Before Pruning': [metrics_before_prune['total_parameters']],
+            'Trainable Parameters Before Pruning': [metrics_before_prune['trainable_parameters']],
+            'Total Parameters After Pruning': [metrics_after_prune['total_parameters']],
+            'Trainable Parameters After Pruning': [metrics_after_prune['trainable_parameters']]
         }
 
         pd.DataFrame(best_metrics_data).to_csv(best_csv_path, index=False)
         mlflow.log_artifact(best_csv_path)
 
         all_folds_csv = f"{mode_str}_all_folds_summary_{timestamp}.csv"
-        pd.DataFrame(fold_results).to_csv(f"./outputs/{all_folds_csv}", index=False)
-        mlflow.log_artifact(f"./outputs/{all_folds_csv}")
+        all_folds_path = f"./outputs/{all_folds_csv}"
+        all_folds_data = []
+        for fold_idx, metrics in enumerate(fold_results):
+            row = {
+                'Fold': fold_idx + 1,
+                'Best Epoch': metrics['best_epoch'],
+                'Val Accuracy': metrics['accuracy'],
+                'Val Precision (Hate)': metrics['precision'],
+                'Val Recall (Hate)': metrics['recall'],
+                'Val F1 (Hate)': metrics['f1'],
+                'Val Precision (Non-Hate)': metrics['precision_negative'],
+                'Val Recall (Non-Hate)': metrics['recall_negative'],
+                'Val F1 (Non-Hate)': metrics['f1_negative'],
+                'Val Macro F1': metrics['macro_f1'],
+                'Val ROC-AUC': metrics['roc_auc'],
+                'Val Loss': metrics['loss'],
+                'Best Threshold': metrics['best_threshold'],
+                'Train Accuracy': metrics['train_accuracy'],
+                'Train Precision (Hate)': metrics['train_precision'],
+                'Train Recall (Hate)': metrics['train_recall'],
+                'Train F1 (Hate)': metrics['train_f1'],
+                'Train Precision (Non-Hate)': metrics['train_precision_negative'],
+                'Train Recall (Non-Hate)': metrics['train_recall_negative'],
+                'Train F1 (Non-Hate)': metrics['train_f1_negative'],
+                'Train Macro F1': metrics['train_macro_f1'],
+                'Train ROC-AUC': metrics['train_roc_auc'],
+                'Train Loss': metrics['train_loss']
+            }
+            all_folds_data.append(row)
+        pd.DataFrame(all_folds_data).to_csv(all_folds_path, index=False)
+        mlflow.log_artifact(all_folds_path)
 
         mlflow.log_metric("best_val_macro_f1", best_macro_f1)
         mlflow.log_metric("best_fold", best_fold_idx + 1)
         mlflow.log_metric("best_epoch", best_overall_epoch)
 
-        print_experiment_summary(best_fold_idx, best_overall_metrics, get_model_metrics(final_model))
+        print_experiment_summary(best_fold_idx, best_overall_metrics, metrics_after_prune)  # Use after for summary
 
         print(f"\n{'='*70}")
         print("TRAINING COMPLETED!")
