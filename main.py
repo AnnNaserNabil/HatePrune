@@ -1,11 +1,10 @@
-# main.py (updated: handles calib samples, prune method logic)
+# main.py (final fixed version: correct pruning handling, clean saving, consistent metrics)
 import os
 import time
 import torch
 from torch.utils.data import DataLoader
 import mlflow
 import pandas as pd
-import numpy as np
 from transformers import AutoTokenizer
 from config import parse_arguments, print_config
 from data import load_and_preprocess_data, prepare_kfold_splits, HateSpeechDataset, calculate_class_weights, get_calibration_samples
@@ -27,7 +26,7 @@ def run_kfold(config, comments, labels, tokenizer, device):
     splits = list(prepare_kfold_splits(comments, labels, config.num_folds,
                                        config.stratification_type, config.seed))
 
-    # For Wanda: Get calib samples once
+    # For Wanda: Get calib samples once (outside folds)
     calib_texts = None
     if config.prune and config.prune_method == 'wanda':
         calib_texts = get_calibration_samples(comments, labels, config.calib_samples, config.seed)
@@ -37,7 +36,7 @@ def run_kfold(config, comments, labels, tokenizer, device):
     best_fold_idx = -1
     best_overall_metrics = {}
     best_overall_epoch = -1
-    best_state_dict = None
+    best_state_dict = None  # Will hold permanently pruned (clean) weights
 
     run_name = f"{config.author_name}_{'Distill' if config.distill else 'Train'}{'_Prune' if config.prune else ''}_{config.prune_method}"
     with mlflow.start_run(run_name=run_name) as run:
@@ -61,7 +60,7 @@ def run_kfold(config, comments, labels, tokenizer, device):
                 prune_method=config.prune_method,
                 prune_sparsity=config.prune_sparsity,
                 prune_global=config.prune_global,
-                calib_texts=calib_texts,  # For Wanda
+                calib_texts=calib_texts,
                 device=device
             ).to(device)
 
@@ -101,15 +100,15 @@ def run_kfold(config, comments, labels, tokenizer, device):
                         print(f"Early stopping triggered at epoch {epoch+1}")
                         break
 
-            # Load best checkpoint of this fold
+            # Load the best checkpoint for this fold
             if best_fold_state is not None:
                 model.load_state_dict(best_fold_state)
 
-            # Make pruning permanent if applicable
+            # === CRITICAL: Make pruning permanent BEFORE saving or updating global best ===
             if config.prune:
                 model.make_pruning_permanent()
 
-            # Final evaluation
+            # Final evaluation on the permanently pruned model
             val_metrics = evaluate(model, val_loader, device)
             train_metrics = evaluate(model, train_loader, device)
 
@@ -119,49 +118,44 @@ def run_kfold(config, comments, labels, tokenizer, device):
                 if k != 'best_threshold':
                     final_metrics[f'train_{k}'] = v
             final_metrics['best_epoch'] = best_epoch
-            final_metrics['loss'] = val_metrics.get('loss', 0.0)
-            final_metrics['train_loss'] = train_metrics.get('loss', 0.0)
 
             fold_results.append(final_metrics)
             print_fold_summary(fold, final_metrics, best_epoch)
 
-            # Update global best
+            # Update global best — using the clean, permanently pruned state dict
             if val_metrics['macro_f1'] > best_macro_f1:
                 best_macro_f1 = val_metrics['macro_f1']
                 best_fold_idx = fold
                 best_overall_metrics = final_metrics
                 best_overall_epoch = best_epoch
-                best_state_dict = best_fold_state
+                best_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}  # Clean weights (no _orig/_mask)
 
-        # SAVE BEST MODEL
+        # ====================== SAVE BEST MODEL ======================
         model_name_safe = config.model_path.split('/')[-1]
         mode_str = f"{config.prune_method}_pruned" if config.prune else 'distilled' if config.distill else 'trained'
         best_model_dir = f"./best_{mode_str}_model_{config.author_name.replace(' ', '_')}_{model_name_safe}"
         os.makedirs(best_model_dir, exist_ok=True)
 
+        # Create final model WITHOUT any pruning logic (clean load)
         final_model = Model(
             student_name=config.model_path,
             teacher_name=config.teacher if config.distill else None,
             dropout=config.dropout,
-            prune=config.prune,
-            prune_method=config.prune_method,
+            prune=False,               # No pruning preparation
+            prune_method='baseline',   # Safe default
             prune_sparsity=config.prune_sparsity,
             prune_global=config.prune_global,
-            calib_texts=calib_texts,
+            calib_texts=None,
             device=device
-        )
+        ).to(device)
+
+        # Load the clean state dict (already has real zeros)
         final_model.load_state_dict(best_state_dict)
 
-        # Get metrics BEFORE making pruning permanent
-        metrics_before_prune = get_model_metrics(final_model)
+        # Get final model metrics (pruning is permanent)
+        model_metrics = get_model_metrics(final_model)
 
-        # Make pruning permanent if applicable
-        if config.prune:
-            final_model.make_pruning_permanent()
-
-        # Get metrics AFTER making pruning permanent
-        metrics_after_prune = get_model_metrics(final_model)
-
+        # Save the pruned model
         final_model.student.save_pretrained(best_model_dir)
         tokenizer.save_pretrained(best_model_dir)
 
@@ -169,7 +163,7 @@ def run_kfold(config, comments, labels, tokenizer, device):
         print(f"   → {os.path.abspath(best_model_dir)}")
         print(f"   → Val Macro F1: {best_macro_f1:.4f} (Fold {best_fold_idx+1}, Epoch {best_overall_epoch})")
 
-        # SAVE METRICS CSVs
+        # ====================== SAVE METRICS CSVs ======================
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         best_csv_name = f"{mode_str}_best_metrics_batch{config.batch}_lr{config.lr}_epochs{config.epochs}_{timestamp}.csv"
         best_csv_path = os.path.join("./outputs", best_csv_name)
@@ -199,15 +193,18 @@ def run_kfold(config, comments, labels, tokenizer, device):
             'Train Macro F1': [best_overall_metrics['train_macro_f1']],
             'Train ROC-AUC': [best_overall_metrics['train_roc_auc']],
             'Train Loss': [best_overall_metrics['train_loss']],
-            'Total Parameters Before Pruning': [metrics_before_prune['total_parameters']],
-            'Trainable Parameters Before Pruning': [metrics_before_prune['trainable_parameters']],
-            'Total Parameters After Pruning': [metrics_after_prune['total_parameters']],
-            'Trainable Parameters After Pruning': [metrics_after_prune['trainable_parameters']]
+            'Total Parameters': [model_metrics['total_parameters']],
+            'Trainable Parameters': [model_metrics['trainable_parameters']],
+            'Model Size (MB)': [model_metrics['model_size_mb']],
+            'Total Weights': [model_metrics['total_weights']],
+            'Non-zero Weights': [model_metrics['non_zero_weights']],
+            'Sparsity (%)': [model_metrics['sparsity_percent']]
         }
 
         pd.DataFrame(best_metrics_data).to_csv(best_csv_path, index=False)
         mlflow.log_artifact(best_csv_path)
 
+        # All folds summary
         all_folds_csv = f"{mode_str}_all_folds_summary_{timestamp}.csv"
         all_folds_path = f"./outputs/{all_folds_csv}"
         all_folds_data = []
@@ -245,7 +242,7 @@ def run_kfold(config, comments, labels, tokenizer, device):
         mlflow.log_metric("best_fold", best_fold_idx + 1)
         mlflow.log_metric("best_epoch", best_overall_epoch)
 
-        print_experiment_summary(best_fold_idx, best_overall_metrics, metrics_after_prune)  # Use after for summary
+        print_experiment_summary(best_fold_idx, best_overall_metrics, model_metrics)
 
         print(f"\n{'='*70}")
         print("TRAINING COMPLETED!")
